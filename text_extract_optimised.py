@@ -10,43 +10,72 @@ from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from google.cloud import vision
+from google.cloud.vision_v1 import types
+import io
+import matplotlib.pyplot as plt
 import keras_ocr
 import pytesseract
-import requests
-import json
-from google.cloud import vision
-import io
+from lime import lime_image
+from skimage.segmentation import mark_boundaries
+from concurrent.futures import ThreadPoolExecutor
 
 # Set the Google Cloud credentials
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\sunka\Downloads\sonic-ego-426808-a7-ddc5fa32cf43.json"
 
-# Set the API keys and model IDs for NanoNets
-os.environ["NANONETS_API_KEY"] = "cd18ec99-4816-11ef-9e5e-ea8efc3630fe"
-os.environ["NANONETS_MODEL_ID"] = "128a2d11-9f96-4d62-af62-29c792fedaf5"
+# Define OCR functions
+def perform_ocr_google_vision(image_path):
+    """Perform OCR using Google Cloud Vision API"""
+    client = vision.ImageAnnotatorClient()
+    with io.open(image_path, 'rb') as image_file:
+        content = image_file.read()
+    image = types.Image(content=content)
+    response = client.text_detection(image=image)
+    texts = response.text_annotations
+    return texts[0].description.replace('\n', ' ') if texts else "No text detected."
+
+def preprocess_image(image_path):
+    """Preprocess the image to enhance text for OCR"""
+    image = cv2.imread(image_path)
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, binary_image = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    denoised_image = cv2.fastNlMeansDenoising(binary_image, None, 30, 7, 21)
+    return denoised_image
+
+def perform_ocr_pytesseract(image_path):
+    """Perform OCR using pytesseract with improved preprocessing"""
+    preprocessed_image = preprocess_image(image_path)
+    text = pytesseract.image_to_string(preprocessed_image)
+    return text.replace('\n', ' ')
+
+def perform_ocr_keras_ocr(image_path):
+    """Perform OCR using keras-ocr"""
+    pipeline = keras_ocr.pipeline.Pipeline()
+    images = [keras_ocr.tools.read(image_path)]
+    prediction_groups = pipeline.recognize(images)
+    text = " ".join([word for word, box in prediction_groups[0]])
+    return text
 
 # Define paths and directories
 train_data_dir = 'train'
 validation_data_dir = 'valid'
-image_folder = 'images'  # Folder containing the images for inference
+image_folder = 'images'
 
-# Create DataFrames for train and validation data
 def get_image_files(data_dir):
-    return [os.path.join(data_dir, img) for img in os.listdir(data_dir) if img.endswith(('jpg', 'jpeg', 'png'))]
-
-train_images = get_image_files(train_data_dir)
-validation_images = get_image_files(validation_data_dir)
+    return [os.path.join(data_dir, img) for img in os.listdir(data_dir) if img.endswith(('jpg', 'jpeg'))]
 
 def create_dataframe(images, label):
     return pd.DataFrame({'filename': images, 'label': label})
 
+train_images = get_image_files(train_data_dir)
+validation_images = get_image_files(validation_data_dir)
+
 train_df = create_dataframe(train_images, 'tire')
 validation_df = create_dataframe(validation_images, 'tire')
 
-# Add dummy second class
-dummy_train_df = create_dataframe(train_images[:10], 'non_tire')  # Reuse some images for dummy class
-dummy_validation_df = create_dataframe(validation_images[:5], 'non_tire')  # Reuse some images for dummy class
+dummy_train_df = create_dataframe(train_images[:10], 'non_tire')
+dummy_validation_df = create_dataframe(validation_images[:5], 'non_tire')
 
-# Combine DataFrames
 train_df = pd.concat([train_df, dummy_train_df])
 validation_df = pd.concat([validation_df, dummy_validation_df])
 
@@ -55,29 +84,21 @@ batch_size = 32
 epochs = 20
 image_size = (224, 224)
 
-# Register the swish activation function
-tf.keras.utils.get_custom_objects().update({'swish': tf.keras.activations.swish})
-
-# Load EfficientNet B3 pre-trained on ImageNet
+# Load EfficientNet B3 model
 base_model = EfficientNetB3(weights='imagenet', include_top=False, input_shape=(image_size[0], image_size[1], 3))
 
-# Add custom layers for classification
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
 x = Dense(1024, activation='relu')(x)
 predictions = Dense(1, activation='sigmoid')(x)
 
-# Create model
 model = Model(inputs=base_model.input, outputs=predictions)
 
-# Freeze base layers during initial training
 for layer in base_model.layers:
     layer.trainable = False
 
-# Compile model
 model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
 
-# Data augmentation including rotation and brightness adjustments
 train_datagen = ImageDataGenerator(
     rescale=1./255,
     rotation_range=20,
@@ -90,7 +111,6 @@ train_datagen = ImageDataGenerator(
 
 test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=preprocess_input)
 
-# Debug: Check if data generators found images
 print(f"Found {len(train_df)} images in training directory.")
 print(f"Found {len(validation_df)} images in validation directory.")
 
@@ -110,111 +130,109 @@ validation_generator = test_datagen.flow_from_dataframe(
     batch_size=batch_size,
     class_mode='binary')
 
-# Calculate steps_per_epoch and validation_steps
 steps_per_epoch = max(1, len(train_df) // batch_size)
 validation_steps = max(1, len(validation_df) // batch_size)
 
-# Callbacks
-checkpoint = ModelCheckpoint('tire_detection_model_new.keras', monitor='val_accuracy', save_best_only=True, mode='max', verbose=1)
+checkpoint = ModelCheckpoint('new_model.keras', monitor='val_accuracy', save_best_only=True, mode='max', verbose=1)
 early_stopping = EarlyStopping(monitor='val_loss', patience=5, verbose=1, restore_best_weights=True)
 
-# Train the new model
 history = model.fit(
     train_generator,
     steps_per_epoch=steps_per_epoch,
     epochs=epochs,
     validation_data=validation_generator,
     validation_steps=validation_steps,
-    callbacks=[checkpoint, early_stopping]
-)
+    callbacks=[checkpoint, early_stopping])
 
-# Save the final model
-model.save('tire_detection_model_new.keras')
+model.save('tire_detection_model.keras')
 
-def load_model():
-    """Load the model from a file"""
-    try:
-        model = tf.keras.models.load_model('tire_detection_model_new.keras', custom_objects={'swish': tf.keras.activations.swish})
-        return model
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return None
-
-# Function to perform OCR using NanoNets
-def perform_ocr_nanonets(image_path):
-    """Perform OCR using NanoNets API"""
-    url = 'https://app.nanonets.com/api/v2/OCR/Model/' + os.environ["NANONETS_MODEL_ID"] + '/LabelFile/'
-    data = {'file': open(image_path, 'rb')}
-    response = requests.post(url, auth=requests.auth.HTTPBasicAuth(os.environ["NANONETS_API_KEY"], ''), files=data)
-    result = response.json()
-    if 'result' in result:
-        return " ".join([obj['text'] for obj in result['result'][0]['prediction']])
-    return "No text detected."
-
-# Function to perform OCR using Google Vision
-def perform_ocr_google_vision(image_path):
-    """Perform OCR using Google Cloud Vision API"""
-    client = vision.ImageAnnotatorClient()
-    with io.open(image_path, 'rb') as image_file:
-        content = image_file.read()
-    image = vision.Image(content=content)
-    response = client.text_detection(image=image)
-    texts = response.text_annotations
-    return texts[0].description.replace('\n', ' ') if texts else "No text detected."
-
-# Function to perform OCR using pytesseract
-def perform_ocr_pytesseract(image_path):
-    """Perform OCR using pytesseract"""
-    text = pytesseract.image_to_string(image_path)
-    return text.replace('\n', ' ')
-
-# Function to perform OCR using keras-ocr
-def perform_ocr_keras_ocr(image_path):
-    """Perform OCR using keras-ocr"""
-    pipeline = keras_ocr.pipeline.Pipeline()
-    images = [keras_ocr.tools.read(image_path)]
-    prediction_groups = pipeline.recognize(images)
-    text = " ".join([word for word, box in prediction_groups[0]])
-    return text
-
-# Function to detect tire and extract text
 def detect_tire_and_extract_text(image_path, model):
-    # Load the image
+    # Load and preprocess image
     image = cv2.imread(image_path)
-    orig_image = image.copy()
-    
-    # Resize and preprocess the image
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = cv2.resize(image, image_size)
-    image = preprocess_input(np.expand_dims(image, axis=0))  # Ensure correct shape
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_resized = cv2.resize(image_rgb, image_size)
+    image_preprocessed = preprocess_input(np.expand_dims(image_resized, axis=0))
 
     # Predict if the image contains a tire
-    prediction = model.predict(image)[0][0]
+    prediction = model.predict(image_preprocessed)[0][0]
 
-    # Perform OCR using four different methods
-    text_google_vision = perform_ocr_google_vision(image_path)
-    text_pytesseract = perform_ocr_pytesseract(image_path)
-    text_keras_ocr = perform_ocr_keras_ocr(image_path)
-    text_nanonets = perform_ocr_nanonets(image_path)
+    # Perform OCR using multiple methods
+    texts = {
+        "google_vision": perform_ocr_google_vision(image_path),
+        "pytesseract": perform_ocr_pytesseract(image_path),
+        "keras_ocr": perform_ocr_keras_ocr(image_path)
+    }
 
-    # Combine texts from different methods
-    combined_text = f"Google Vision OCR: {text_google_vision}\n" \
-                    f"Pytesseract OCR: {text_pytesseract}\n" \
-                    f"Keras OCR: {text_keras_ocr}\n" \
-                    f"NanoNets OCR: {text_nanonets}"
+    combined_text = " ".join(texts.values())
+
+    if prediction > 0.4:
+        print(f"Tire detected in {image_path}")
+
+        # Use LIME for explanation
+        explainer = lime_image.LimeImageExplainer()
+
+        def predict_fn(images):
+            return model.predict(preprocess_input(images))
+
+        explanation = explainer.explain_instance(image_resized.astype('double'),
+                                                 predict_fn,
+                                                 top_labels=1,
+                                                 hide_color=0,
+                                                 num_samples=1000)
+
+        temp, mask = explanation.get_image_and_mask(explanation.top_labels[0], positive_only=True, num_features=5, hide_rest=True)
+        img_boundry = mark_boundaries(temp / 2 + 0.5, mask)
+
+        lime_folder = 'lime_plots'
+        os.makedirs(lime_folder, exist_ok=True)
+        lime_plot_path = os.path.join(lime_folder, os.path.basename(image_path))
+        img_boundry_normalized = (img_boundry - img_boundry.min()) / (img_boundry.max() - img_boundry.min())
+        plt.imsave(lime_plot_path, img_boundry_normalized)
+
+        # Extract DOT code and date code
+        dot_code = None
+        date_code = None
+        combined_words = combined_text.split()
+        for i, word in enumerate(combined_words):
+            if word.upper() == "DOT" and i + 1 < len(combined_words):
+                dot_code_parts = [word]
+                next_word_index = i + 1
+                while next_word_index < len(combined_words):
+                    next_word = combined_words[next_word_index]
+                    if any(char.isdigit() for char in next_word) and len(''.join(filter(str.isdigit, next_word))) >= 4:
+                        dot_code_parts.append(next_word)
+                        break
+                    else:
+                        dot_code_parts.append(next_word)
+                        next_word_index += 1
+                dot_code = ' '.join(dot_code_parts)
+                break
+
+        if dot_code:
+            digits = ''.join(filter(str.isdigit, dot_code))
+            if len(digits) >= 4:
+                date_code = digits[-4:]
+
+        return os.path.basename(image_path), combined_text.strip(), dot_code, date_code
+    else:
+        print(f"No tire detected in {image_path}")
+        return os.path.basename(image_path), combined_text.strip(), None, None
+
+def process_images_in_folder(folder_path, model):
+    image_paths = [os.path.join(folder_path, img) for img in os.listdir(folder_path) if img.lower().endswith(('.jpg', '.jpeg', '.png'))]
     
-    return prediction, combined_text
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda img_path: detect_tire_and_extract_text(img_path, model), image_paths))
+    
+    return results
 
-# Load the model
-model = load_model()
+output_file = 'extracted_texts.txt'
+results = process_images_in_folder(image_folder, model)
 
-# Process all images in the image folder
-if model:
-    image_files = get_image_files(image_folder)
-    for image_path in image_files:
-        prediction, combined_text = detect_tire_and_extract_text(image_path, model)
-        print(f"Image: {image_path}")
-        print(f"Prediction: {'Tire' if prediction >= 0.5 else 'Non-Tire'}")
-        print(f"Extracted Text:\n{combined_text}\n")
-else:
-    print("Model could not be loaded.")
+with open(output_file, 'w', encoding='utf-8') as f:
+    for filename, extracted_text, dot_code, date_code in results:
+        f.write(f"Extracted text for {filename}: {extracted_text}\n")
+        if dot_code:
+            f.write(f"DOT code for {filename}: DOT {dot_code}\n")
+        if date_code:
+            f.write(f"Manufacturing date: {date_code}\n")
