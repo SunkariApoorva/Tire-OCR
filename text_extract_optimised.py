@@ -56,6 +56,20 @@ def perform_ocr_keras_ocr(image_path):
     text = " ".join([word for word, box in prediction_groups[0]])
     return text
 
+def is_blurry(image_path, threshold=100):
+    """Check if the image is blurry based on variance of Laplacian"""
+    image = cv2.imread(image_path)
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    variance = cv2.Laplacian(gray_image, cv2.CV_64F).var()
+    return variance < threshold
+
+def enhance_blurry_image(image_path):
+    """Enhance resolution of blurry images"""
+    image = cv2.imread(image_path)
+    new_size = (image.shape[1] * 2, image.shape[0] * 2)  # Double the resolution
+    enhanced_image = cv2.resize(image, new_size, interpolation=cv2.INTER_CUBIC)
+    return enhanced_image
+
 # Define paths and directories
 train_data_dir = 'train'
 validation_data_dir = 'valid'
@@ -147,10 +161,17 @@ history = model.fit(
 model.save('tire_detection_model.keras')
 
 def detect_tire_and_extract_text(image_path, model):
-    # Load and preprocess image
-    image = cv2.imread(image_path)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image_resized = cv2.resize(image_rgb, image_size)
+    # Check if the image is blurry
+    if is_blurry(image_path):
+        print(f"Image is blurry: {image_path}")
+        image = enhance_blurry_image(image_path)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image_rgb, image_size)
+    else:
+        image = cv2.imread(image_path)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image_rgb, image_size)
+
     image_preprocessed = preprocess_input(np.expand_dims(image_resized, axis=0))
 
     # Predict if the image contains a tire
@@ -172,7 +193,10 @@ def detect_tire_and_extract_text(image_path, model):
         explainer = lime_image.LimeImageExplainer()
 
         def predict_fn(images):
-            return model.predict(preprocess_input(images))
+            # Convert images to appropriate format for prediction
+            images = np.array(images)
+            preprocessed_images = preprocess_input(images)
+            return model.predict(preprocessed_images)
 
         explanation = explainer.explain_instance(image_resized.astype('double'),
                                                  predict_fn,
@@ -217,6 +241,7 @@ def detect_tire_and_extract_text(image_path, model):
     else:
         print(f"No tire detected in {image_path}")
         return os.path.basename(image_path), combined_text.strip(), None, None
+
 
 def process_images_in_folder(folder_path, model):
     image_paths = [os.path.join(folder_path, img) for img in os.listdir(folder_path) if img.lower().endswith(('.jpg', '.jpeg', '.png'))]
